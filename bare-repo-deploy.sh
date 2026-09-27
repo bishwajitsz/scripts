@@ -1,40 +1,40 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Universal Laravel Deployment Script
+# Universal Bare Repository Deployment Runner
 #
-# Usage:
+# Repository:
+#   https://github.com/bishwajitsz/scripts
 #
-#   curl -fsSL https://gist.githubusercontent.com/USER/GIST_ID/raw/deploy.sh \
-#       | bash -s -- --target /path/to/project --all
+# Intended usage:
 #
-# Examples:
-#
-#   ./deploy.sh --all
-#
-#   ./deploy.sh \
+#   ./bare-repo-deploy.sh \
 #       --target /home/analysis/htdocs/example.com \
 #       --git-dir /home/analysis/repo \
 #       --branch main \
-#       --composer \
-#       --npm \
-#       --build \
-#       --optimize
+#       --all
 #
 ###############################################################################
 
 set -Eeuo pipefail
 
 ###############################################################################
-# Defaults
+# VERSION
 ###############################################################################
 
-TARGET="${DEPLOY_TARGET:-$(pwd)}"
+SCRIPT_NAME="bare-repo-deploy"
+SCRIPT_VERSION="2.0.0"
+
+###############################################################################
+# DEFAULT CONFIGURATION
+###############################################################################
+
+TARGET="${DEPLOY_TARGET:-}"
 GIT_DIR="${DEPLOY_GIT_DIR:-}"
 BRANCH="${DEPLOY_BRANCH:-main}"
 
-PHP_BIN="${PHP_BIN:-php}"
-COMPOSER_BIN="${COMPOSER_BIN:-composer}"
+PHP_BIN="${PHP_BIN:-/usr/bin/php8.5}"
+COMPOSER_BIN="${COMPOSER_BIN:-/usr/local/bin/composer}"
 NPM_BIN="${NPM_BIN:-npm}"
 NODE_BIN="${NODE_BIN:-node}"
 GIT_BIN="${GIT_BIN:-git}"
@@ -43,40 +43,60 @@ PACKISTRY_URL="${PACKISTRY_URL:-https://packistry.tradifylabs.com}"
 
 MEMORY_LIMIT="${MEMORY_LIMIT:-512M}"
 
-RUN_AS_USER=""
-RUN_AS_GROUP=""
+RUN_AS_USER="${DEPLOY_USER:-}"
+RUN_AS_GROUP="${DEPLOY_GROUP:-}"
+
+LOCK_FILE="${DEPLOY_LOCK_FILE:-/tmp/${SCRIPT_NAME}.lock}"
+
+LOG_DIR="${DEPLOY_LOG_DIR:-}"
+LOG_FILE=""
+
+HEALTH_URL=""
+HEALTH_EXPECTED_STATUS="200"
+HEALTH_TIMEOUT="30"
 
 DRY_RUN=false
 VERBOSE=false
-FORCE=false
 AUTO_YES=false
+FORCE=false
+
+MAINTENANCE=false
+MAINTENANCE_RETRY=60
+
+USE_NPM_CI="auto"
 
 ###############################################################################
-# Colors
+# COMMAND QUEUE
+###############################################################################
+
+declare -a COMMANDS=()
+
+###############################################################################
+# COLORS
 ###############################################################################
 
 if [[ -t 1 ]]; then
-    readonly RED='\033[0;31m'
-    readonly GREEN='\033[0;32m'
-    readonly YELLOW='\033[1;33m'
-    readonly BLUE='\033[0;34m'
-    readonly MAGENTA='\033[0;35m'
-    readonly CYAN='\033[0;36m'
-    readonly WHITE='\033[1;37m'
-    readonly NC='\033[0m'
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'
+    CYAN='\033[0;36m'
+    WHITE='\033[1;37m'
+    NC='\033[0m'
 else
-    readonly RED=''
-    readonly GREEN=''
-    readonly YELLOW=''
-    readonly BLUE=''
-    readonly MAGENTA=''
-    readonly CYAN=''
-    readonly WHITE=''
-    readonly NC=''
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    MAGENTA=''
+    CYAN=''
+    WHITE=''
+    NC=''
 fi
 
 ###############################################################################
-# Logging
+# LOGGING
 ###############################################################################
 
 log() {
@@ -103,16 +123,37 @@ debug() {
 
 section() {
     echo
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${WHITE}$*${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
 ###############################################################################
-# Error handling
+# ERROR HANDLING
 ###############################################################################
 
 CURRENT_STEP="initialization"
+DEPLOYMENT_STARTED_AT="$(date +%s)"
+
+MAINTENANCE_ENABLED=false
+
+cleanup() {
+    local exit_code=$?
+
+    if [[ "$MAINTENANCE_ENABLED" == true ]]; then
+        warning "Deployment stopped while maintenance mode is enabled."
+
+        if [[ -f "${TARGET:-}/artisan" ]]; then
+            php_artisan up >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if [[ -n "${LOCK_FD:-}" ]]; then
+        flock -u "$LOCK_FD" 2>/dev/null || true
+    fi
+
+    return "$exit_code"
+}
 
 handle_error() {
     local exit_code=$?
@@ -121,8 +162,8 @@ handle_error() {
     error "Step: ${CURRENT_STEP}"
     error "Exit code: ${exit_code}"
 
-    if [[ -f "$TARGET/artisan" ]]; then
-        warning "Attempting to bring Laravel application back online..."
+    if [[ -f "${TARGET:-}/artisan" ]]; then
+        warning "Attempting Laravel maintenance recovery..."
 
         if [[ "$DRY_RUN" == false ]]; then
             php_artisan up >/dev/null 2>&1 || true
@@ -133,32 +174,11 @@ handle_error() {
 }
 
 trap handle_error ERR
+trap cleanup EXIT
 
 ###############################################################################
-# Helpers
+# BASIC HELPERS
 ###############################################################################
-
-run() {
-    debug "Running: $*"
-
-    if [[ "$DRY_RUN" == true ]]; then
-        echo -e "${YELLOW}[DRY-RUN]${NC} $*"
-        return 0
-    fi
-
-    "$@"
-}
-
-run_shell() {
-    debug "Running shell: $*"
-
-    if [[ "$DRY_RUN" == true ]]; then
-        echo -e "${YELLOW}[DRY-RUN]${NC} $*"
-        return 0
-    fi
-
-    bash -c "$*"
-}
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
@@ -171,8 +191,28 @@ require_command() {
     fi
 }
 
+run() {
+    debug "Running: $*"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} $*"
+        return 0
+    fi
+
+    "$@"
+}
+
+run_quiet() {
+    if [[ "$DRY_RUN" == true ]]; then
+        debug "[DRY-RUN] $*"
+        return 0
+    fi
+
+    "$@" >/dev/null 2>&1
+}
+
 confirm() {
-    if [[ "$AUTO_YES" == true ]]; then
+    if [[ "$AUTO_YES" == true || "$FORCE" == true ]]; then
         return 0
     fi
 
@@ -189,11 +229,68 @@ confirm() {
 }
 
 ###############################################################################
-# PHP / Artisan helpers
+# VALIDATION
+###############################################################################
+
+validate_target() {
+    if [[ -z "$TARGET" ]]; then
+        error "--target is required."
+        exit 1
+    fi
+
+    if [[ ! -d "$TARGET" ]]; then
+        error "Target directory does not exist: $TARGET"
+        exit 1
+    fi
+}
+
+validate_git() {
+    if [[ -z "$GIT_DIR" ]]; then
+        error "--git-dir is required for Git operations."
+        exit 1
+    fi
+
+    if [[ ! -d "$GIT_DIR" ]]; then
+        error "Git directory does not exist: $GIT_DIR"
+        exit 1
+    fi
+}
+
+validate_laravel() {
+    if [[ ! -f "$TARGET/artisan" ]]; then
+        error "Laravel artisan file not found in: $TARGET"
+        exit 1
+    fi
+}
+
+validate_php() {
+    require_command "$PHP_BIN"
+}
+
+validate_environment() {
+    section "Environment Validation"
+
+    validate_target
+    validate_php
+
+    log "Target: $TARGET"
+    log "Branch: $BRANCH"
+    log "PHP: $PHP_BIN"
+    log "Composer: $COMPOSER_BIN"
+    log "Node: $NODE_BIN"
+    log "NPM: $NPM_BIN"
+
+    success "Environment validated."
+}
+
+###############################################################################
+# PHP / ARTISAN
 ###############################################################################
 
 php() {
-    "$PHP_BIN" -d "memory_limit=${MEMORY_LIMIT}" "$@"
+    "$PHP_BIN" \
+        -d "memory_limit=${MEMORY_LIMIT}" \
+        "$@"
 }
 
 php_artisan() {
@@ -201,7 +298,47 @@ php_artisan() {
 }
 
 ###############################################################################
-# Git
+# LOCK
+###############################################################################
+
+acquire_lock() {
+    CURRENT_STEP="Acquire deployment lock"
+
+    section "Deployment Lock"
+
+    require_command flock
+
+    exec {LOCK_FD}>"$LOCK_FILE"
+
+    if ! flock -n "$LOCK_FD"; then
+        error "Another deployment is already running."
+        error "Lock: $LOCK_FILE"
+        exit 1
+    fi
+
+    log "Deployment lock acquired."
+}
+
+###############################################################################
+# LOG FILE
+###############################################################################
+
+setup_logging() {
+    if [[ -z "$LOG_DIR" ]]; then
+        return
+    fi
+
+    mkdir -p "$LOG_DIR"
+
+    LOG_FILE="$LOG_DIR/deploy-$(date '+%Y%m%d-%H%M%S').log"
+
+    exec > >(tee -a "$LOG_FILE") 2>&1
+
+    log "Log file: $LOG_FILE"
+}
+
+###############################################################################
+# GIT
 ###############################################################################
 
 git_checkout() {
@@ -209,14 +346,10 @@ git_checkout() {
 
     section "Git Checkout"
 
-    [[ -n "$GIT_DIR" ]] || {
-        error "--git-dir is required for Git checkout."
-        exit 1
-    }
-
+    validate_git
     require_command "$GIT_BIN"
 
-    log "Checking out branch: $BRANCH"
+    log "Branch: $BRANCH"
 
     run "$GIT_BIN" \
         --work-tree="$TARGET" \
@@ -226,37 +359,28 @@ git_checkout() {
     success "Git checkout completed."
 }
 
-git_pull() {
-    CURRENT_STEP="Git pull"
-
-    section "Git Pull"
-
-    require_command "$GIT_BIN"
-
-    cd "$TARGET"
-
-    run "$GIT_BIN" pull --ff-only
-
-    success "Git pull completed."
-}
-
 git_fetch() {
     CURRENT_STEP="Git fetch"
 
     section "Git Fetch"
 
-    require_command "$GIT_BIN"
+    validate_git
 
-    if [[ -n "$GIT_DIR" ]]; then
-        run "$GIT_BIN" \
-            --git-dir="$GIT_DIR" \
-            fetch --all --prune
-    else
-        cd "$TARGET"
-        run "$GIT_BIN" fetch --all --prune
-    fi
+    run "$GIT_BIN" \
+        --git-dir="$GIT_DIR" \
+        fetch --all --prune
 
     success "Git fetch completed."
+}
+
+git_status() {
+    CURRENT_STEP="Git status"
+
+    section "Git Status"
+
+    cd "$TARGET"
+
+    run "$GIT_BIN" status
 }
 
 git_reset() {
@@ -264,14 +388,10 @@ git_reset() {
 
     section "Git Reset"
 
-    require_command "$GIT_BIN"
-
     cd "$TARGET"
 
-    warning "This will reset the working tree."
-
-    if ! confirm "Continue?"; then
-        warning "Git reset cancelled."
+    if ! confirm "Reset working tree?"; then
+        warning "Cancelled."
         return
     fi
 
@@ -285,14 +405,10 @@ git_clean() {
 
     section "Git Clean"
 
-    require_command "$GIT_BIN"
-
     cd "$TARGET"
 
-    warning "This will remove untracked files."
-
-    if ! confirm "Continue?"; then
-        warning "Git clean cancelled."
+    if ! confirm "Remove untracked files?"; then
+        warning "Cancelled."
         return
     fi
 
@@ -301,35 +417,21 @@ git_clean() {
     success "Git clean completed."
 }
 
-git_status() {
-    CURRENT_STEP="Git status"
-
-    section "Git Status"
-
-    require_command "$GIT_BIN"
-
-    cd "$TARGET"
-
-    run "$GIT_BIN" status
-}
-
 ###############################################################################
-# Composer
+# PACKISTRY
 ###############################################################################
 
 configure_packistry() {
     CURRENT_STEP="Configure Packistry"
 
-    section "Configure Packistry"
+    section "Packistry"
 
     local composer_file="$TARGET/composer.json"
 
     if [[ ! -f "$composer_file" ]]; then
         warning "composer.json not found."
-        return 0
+        return
     fi
-
-    log "Checking composer repositories..."
 
     php -r '
         $file = $argv[1];
@@ -338,24 +440,18 @@ configure_packistry() {
         $json = file_get_contents($file);
 
         if ($json === false) {
-            fwrite(STDERR, "Unable to read composer.json\n");
-            exit(1);
+            throw new RuntimeException("Unable to read composer.json");
         }
 
         $data = json_decode($json, true);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
-            fwrite(
-                STDERR,
-                "Invalid composer.json: " . json_last_error_msg() . PHP_EOL
+            throw new RuntimeException(
+                "Invalid composer.json: " . json_last_error_msg()
             );
-            exit(1);
         }
 
-        if (
-            !isset($data["repositories"]) ||
-            !is_array($data["repositories"])
-        ) {
+        if (!isset($data["repositories"]) || !is_array($data["repositories"])) {
             echo "No repositories section found.\n";
             exit(0);
         }
@@ -365,51 +461,48 @@ configure_packistry() {
         foreach ($data["repositories"] as $key => $repository) {
 
             if (
-                isset($repository["type"], $repository["url"]) &&
-                $repository["type"] === "path" &&
-                $repository["url"] === "../../Packages/*"
+                ($repository["type"] ?? null) === "path" &&
+                ($repository["url"] ?? null) === "../../Packages/*"
             ) {
-                echo "Replacing ../../Packages/* with Packistry...\n";
-
                 $data["repositories"][$key] = [
                     "type" => "composer",
                     "url" => $packistry
                 ];
 
                 $changed = true;
+
+                echo "Replaced ../../Packages/* with Packistry.\n";
             }
         }
 
-        if ($changed) {
-
-            $result = json_encode(
-                $data,
-                JSON_PRETTY_PRINT |
-                JSON_UNESCAPED_SLASHES |
-                JSON_UNESCAPED_UNICODE
-            );
-
-            if ($result === false) {
-                fwrite(STDERR, "Unable to encode composer.json\n");
-                exit(1);
-            }
-
-            file_put_contents(
-                $file,
-                $result . PHP_EOL
-            );
-
-            echo "Packistry configuration updated.\n";
-
-        } else {
-
-            echo "No ../../Packages/* repository found.\n";
+        if (!$changed) {
+            echo "No local Packages repository found.\n";
+            exit(0);
         }
+
+        $encoded = json_encode(
+            $data,
+            JSON_PRETTY_PRINT |
+            JSON_UNESCAPED_SLASHES |
+            JSON_UNESCAPED_UNICODE
+        );
+
+        if ($encoded === false) {
+            throw new RuntimeException("Unable to encode composer.json");
+        }
+
+        file_put_contents($file, $encoded . PHP_EOL);
+
+        echo "composer.json updated successfully.\n";
 
     ' "$composer_file" "$PACKISTRY_URL"
 
-    success "Packistry configuration checked."
+    success "Packistry configuration completed."
 }
+
+###############################################################################
+# COMPOSER
+###############################################################################
 
 composer_validate() {
     CURRENT_STEP="Composer validate"
@@ -439,7 +532,7 @@ composer_install() {
     success "Composer install completed."
 }
 
-composer_install_production() {
+composer_install_prod() {
     CURRENT_STEP="Composer production install"
 
     section "Composer Production Install"
@@ -463,62 +556,40 @@ composer_update() {
 
     cd "$TARGET"
 
-    warning "Composer update modifies composer.lock."
+    if ! confirm "Run composer update?"; then
+        warning "Cancelled."
+        return
+    fi
 
     run "$PHP_BIN" "$COMPOSER_BIN" update \
         --no-interaction \
         --prefer-dist \
         --ignore-platform-reqs
-
-    success "Composer update completed."
 }
 
-composer_dump_autoload() {
-    CURRENT_STEP="Composer dump autoload"
+composer_autoload() {
+    CURRENT_STEP="Composer autoload"
 
-    section "Composer Dump Autoload"
+    section "Composer Autoload"
 
     cd "$TARGET"
 
     run "$PHP_BIN" "$COMPOSER_BIN" dump-autoload \
         --optimize \
         --no-interaction
-
-    success "Composer autoload generated."
 }
 
 composer_clear_cache() {
-    CURRENT_STEP="Composer clear cache"
+    CURRENT_STEP="Composer cache"
 
-    section "Composer Clear Cache"
+    section "Composer Cache"
 
     run "$PHP_BIN" "$COMPOSER_BIN" clear-cache
-
-    success "Composer cache cleared."
-}
-
-composer_about() {
-    CURRENT_STEP="Composer about"
-
-    section "Composer Information"
-
-    run "$PHP_BIN" "$COMPOSER_BIN" about
 }
 
 ###############################################################################
-# NPM / Node
+# NODE
 ###############################################################################
-
-node_version() {
-    CURRENT_STEP="Node version"
-
-    section "Node Version"
-
-    require_command "$NODE_BIN"
-
-    run "$NODE_BIN" --version
-    run "$NPM_BIN" --version
-}
 
 npm_install() {
     CURRENT_STEP="NPM install"
@@ -527,9 +598,14 @@ npm_install() {
 
     cd "$TARGET"
 
-    run "$NPM_BIN" install
+    if [[ "$USE_NPM_CI" == "auto" && -f package-lock.json ]]; then
+        log "package-lock.json found. Using npm ci."
+        run "$NPM_BIN" ci
+    else
+        run "$NPM_BIN" install
+    fi
 
-    success "NPM install completed."
+    success "NPM dependencies installed."
 }
 
 npm_ci() {
@@ -551,29 +627,12 @@ npm_update() {
 
     cd "$TARGET"
 
+    if ! confirm "Run npm update?"; then
+        warning "Cancelled."
+        return
+    fi
+
     run "$NPM_BIN" update
-
-    success "NPM update completed."
-}
-
-npm_audit() {
-    CURRENT_STEP="NPM audit"
-
-    section "NPM Audit"
-
-    cd "$TARGET"
-
-    run "$NPM_BIN" audit
-}
-
-npm_outdated() {
-    CURRENT_STEP="NPM outdated"
-
-    section "NPM Outdated"
-
-    cd "$TARGET"
-
-    run "$NPM_BIN" outdated
 }
 
 npm_build() {
@@ -588,139 +647,146 @@ npm_build() {
     success "NPM build completed."
 }
 
-npm_dev() {
-    CURRENT_STEP="NPM dev"
+npm_audit() {
+    CURRENT_STEP="NPM audit"
 
-    section "NPM Dev"
+    section "NPM Audit"
 
     cd "$TARGET"
 
-    run "$NPM_BIN" run dev
+    run "$NPM_BIN" audit
 }
 
 ###############################################################################
-# Laravel Maintenance
+# MAINTENANCE
 ###############################################################################
 
 maintenance_down() {
-    CURRENT_STEP="Laravel maintenance down"
+    CURRENT_STEP="Maintenance down"
 
-    section "Maintenance Mode: ON"
+    section "Maintenance Mode ON"
 
-    php_artisan down \
-        --retry=60
+    validate_laravel
 
-    success "Application is now in maintenance mode."
+    php_artisan down --retry="$MAINTENANCE_RETRY"
+
+    MAINTENANCE_ENABLED=true
+
+    success "Application is in maintenance mode."
 }
 
 maintenance_up() {
-    CURRENT_STEP="Laravel maintenance up"
+    CURRENT_STEP="Maintenance up"
 
-    section "Maintenance Mode: OFF"
+    section "Maintenance Mode OFF"
+
+    validate_laravel
 
     php_artisan up
+
+    MAINTENANCE_ENABLED=false
 
     success "Application is online."
 }
 
 ###############################################################################
-# Laravel Cache
+# CACHE
 ###############################################################################
 
-artisan_optimize_clear() {
-    CURRENT_STEP="Laravel optimize clear"
+optimize_clear() {
+    CURRENT_STEP="Optimize clear"
 
     section "Laravel Optimize Clear"
 
-    php_artisan optimize:clear
+    validate_laravel
 
-    success "Laravel optimization caches cleared."
+    php_artisan optimize:clear
 }
 
-artisan_optimize() {
-    CURRENT_STEP="Laravel optimize"
+optimize() {
+    CURRENT_STEP="Optimize"
 
     section "Laravel Optimize"
 
+    validate_laravel
+
     php_artisan optimize
-
-    success "Laravel optimization completed."
-}
-
-config_clear() {
-    CURRENT_STEP="Config clear"
-
-    section "Config Clear"
-
-    php_artisan config:clear
 }
 
 config_cache() {
     CURRENT_STEP="Config cache"
 
-    section "Config Cache"
+    validate_laravel
 
     php_artisan config:cache
 }
 
-route_clear() {
-    CURRENT_STEP="Route clear"
+config_clear() {
+    CURRENT_STEP="Config clear"
 
-    section "Route Clear"
+    validate_laravel
 
-    php_artisan route:clear
+    php_artisan config:clear
 }
 
 route_cache() {
     CURRENT_STEP="Route cache"
 
-    section "Route Cache"
+    validate_laravel
 
     php_artisan route:cache
 }
 
-view_clear() {
-    CURRENT_STEP="View clear"
+route_clear() {
+    CURRENT_STEP="Route clear"
 
-    section "View Clear"
+    validate_laravel
 
-    php_artisan view:clear
+    php_artisan route:clear
 }
 
 view_cache() {
     CURRENT_STEP="View cache"
 
-    section "View Cache"
+    validate_laravel
 
     php_artisan view:cache
 }
 
-event_clear() {
-    CURRENT_STEP="Event clear"
+view_clear() {
+    CURRENT_STEP="View clear"
 
-    section "Event Clear"
+    validate_laravel
 
-    php_artisan event:clear
+    php_artisan view:clear
 }
 
 event_cache() {
     CURRENT_STEP="Event cache"
 
-    section "Event Cache"
+    validate_laravel
 
     php_artisan event:cache
+}
+
+event_clear() {
+    CURRENT_STEP="Event clear"
+
+    validate_laravel
+
+    php_artisan event:clear
 }
 
 cache_clear() {
     CURRENT_STEP="Application cache clear"
 
-    section "Application Cache Clear"
+    validate_laravel
 
     php_artisan cache:clear
 }
 
 ###############################################################################
-# Laravel Database
+# DATABASE
 ###############################################################################
 
 migrate() {
@@ -728,104 +794,99 @@ migrate() {
 
     section "Database Migration"
 
+    validate_laravel
+
     php_artisan migrate \
         --force \
         --no-interaction
 
-    success "Database migrations completed."
+    success "Migrations completed."
 }
 
-migrate_fresh() {
-    CURRENT_STEP="Database migrate fresh"
+migrate_status() {
+    CURRENT_STEP="Migration status"
 
-    section "Database Migrate Fresh"
+    validate_laravel
 
-    warning "WARNING: migrate:fresh destroys all database tables."
-
-    if ! confirm "Are you absolutely sure?"; then
-        warning "Migration cancelled."
-        return
-    fi
-
-    php_artisan migrate:fresh \
-        --force \
-        --no-interaction
-
-    success "Database recreated."
+    php_artisan migrate:status
 }
 
 migrate_rollback() {
-    CURRENT_STEP="Database rollback"
+    CURRENT_STEP="Migration rollback"
 
-    section "Database Rollback"
+    validate_laravel
 
     php_artisan migrate:rollback \
         --force \
         --no-interaction
 }
 
-migrate_status() {
-    CURRENT_STEP="Migration status"
+migrate_fresh() {
+    CURRENT_STEP="Migration fresh"
 
-    section "Migration Status"
+    section "DANGER: MIGRATE FRESH"
 
-    php_artisan migrate:status
+    warning "This will destroy all database tables."
+
+    if ! confirm "Continue?"; then
+        return
+    fi
+
+    validate_laravel
+
+    php_artisan migrate:fresh \
+        --force \
+        --no-interaction
 }
 
-db_seed() {
+seed() {
     CURRENT_STEP="Database seed"
 
-    section "Database Seed"
+    validate_laravel
 
     php_artisan db:seed \
         --force \
         --no-interaction
-
-    success "Database seeding completed."
 }
 
 ###############################################################################
-# Laravel Storage
+# STORAGE
 ###############################################################################
 
 storage_link() {
     CURRENT_STEP="Storage link"
 
-    section "Storage Link"
+    validate_laravel
 
     php_artisan storage:link
-
-    success "Storage link created."
 }
 
 storage_unlink() {
     CURRENT_STEP="Storage unlink"
 
-    section "Storage Unlink"
+    validate_laravel
 
     php_artisan storage:unlink
-
-    success "Storage link removed."
 }
 
 ###############################################################################
-# Queue
+# QUEUE
 ###############################################################################
 
 queue_restart() {
     CURRENT_STEP="Queue restart"
 
-    section "Queue Restart"
+    validate_laravel
 
     php_artisan queue:restart
 
-    success "Queue restart signal sent."
+    success "Queue restart requested."
 }
 
 queue_work() {
     CURRENT_STEP="Queue worker"
 
-    section "Queue Worker"
+    validate_laravel
 
     php_artisan queue:work
 }
@@ -833,59 +894,59 @@ queue_work() {
 queue_flush() {
     CURRENT_STEP="Queue flush"
 
-    section "Queue Flush"
-
-    warning "This removes all jobs from the queue."
+    warning "This will flush queued jobs."
 
     if ! confirm "Continue?"; then
         return
     fi
+
+    validate_laravel
 
     php_artisan queue:flush
 }
 
-failed_jobs_retry() {
+failed_retry() {
     CURRENT_STEP="Failed jobs retry"
 
-    section "Retry Failed Jobs"
+    validate_laravel
 
     php_artisan queue:retry all
 }
 
-failed_jobs_flush() {
+failed_flush() {
     CURRENT_STEP="Failed jobs flush"
 
-    section "Flush Failed Jobs"
-
-    warning "This permanently removes failed jobs."
+    warning "This will remove failed jobs."
 
     if ! confirm "Continue?"; then
         return
     fi
+
+    validate_laravel
 
     php_artisan queue:flush
 }
 
 ###############################################################################
-# Laravel Scheduler
+# SCHEDULER
 ###############################################################################
 
 schedule_list() {
     CURRENT_STEP="Schedule list"
 
-    section "Laravel Schedule"
+    validate_laravel
 
     php_artisan schedule:list
 }
 
 ###############################################################################
-# Laravel Horizon
+# HORIZON
 ###############################################################################
 
 horizon_pause() {
     CURRENT_STEP="Horizon pause"
 
-    section "Horizon Pause"
+    validate_laravel
 
     php_artisan horizon:pause
 }
@@ -893,7 +954,7 @@ horizon_pause() {
 horizon_continue() {
     CURRENT_STEP="Horizon continue"
 
-    section "Horizon Continue"
+    validate_laravel
 
     php_artisan horizon:continue
 }
@@ -901,33 +962,13 @@ horizon_continue() {
 horizon_terminate() {
     CURRENT_STEP="Horizon terminate"
 
-    section "Horizon Terminate"
+    validate_laravel
 
     php_artisan horizon:terminate
 }
 
 ###############################################################################
-# Laravel Passport / Sanctum / common package commands
-###############################################################################
-
-passport_install() {
-    CURRENT_STEP="Passport install"
-
-    section "Passport Install"
-
-    php_artisan passport:install
-}
-
-passport_keys() {
-    CURRENT_STEP="Passport keys"
-
-    section "Passport Keys"
-
-    php_artisan passport:keys
-}
-
-###############################################################################
-# Permissions
+# STORAGE / PERMISSIONS
 ###############################################################################
 
 permissions() {
@@ -936,96 +977,85 @@ permissions() {
     section "Permissions"
 
     if [[ -z "$RUN_AS_USER" ]]; then
-        warning "No --user supplied. Skipping ownership changes."
+        warning "--user not supplied. Skipping ownership."
         return
     fi
 
     local group="${RUN_AS_GROUP:-$RUN_AS_USER}"
 
-    log "Setting ownership to ${RUN_AS_USER}:${group}"
-
     run chown -R "${RUN_AS_USER}:${group}" "$TARGET"
 
-    if [[ -d "$TARGET/storage" ]]; then
+    [[ -d "$TARGET/storage" ]] &&
         run chmod -R ug+rwX "$TARGET/storage"
-    fi
 
-    if [[ -d "$TARGET/bootstrap/cache" ]]; then
+    [[ -d "$TARGET/bootstrap/cache" ]] &&
         run chmod -R ug+rwX "$TARGET/bootstrap/cache"
-    fi
 
     success "Permissions updated."
 }
 
 ###############################################################################
-# Laravel package publishing
-###############################################################################
-
-vendor_publish() {
-    CURRENT_STEP="Vendor publish"
-
-    section "Vendor Publish"
-
-    php_artisan vendor:publish \
-        --all \
-        --force
-}
-
-###############################################################################
-# Application health checks
+# HEALTH CHECK
 ###############################################################################
 
 health_check() {
     CURRENT_STEP="Health check"
 
-    section "Application Health Check"
+    section "Health Check"
 
-    if [[ ! -f "$TARGET/artisan" ]]; then
-        warning "Laravel artisan file not found."
-        return
-    fi
+    validate_laravel
 
-    log "Laravel version:"
+    log "Laravel:"
     php_artisan --version
 
-    log "PHP version:"
+    log "PHP:"
     php --version | head -n 1
 
     if command_exists "$NODE_BIN"; then
-        log "Node version:"
+        log "Node:"
         "$NODE_BIN" --version
     fi
 
     if command_exists "$NPM_BIN"; then
-        log "NPM version:"
+        log "NPM:"
         "$NPM_BIN" --version
     fi
 
     if command_exists "$COMPOSER_BIN"; then
-        log "Composer version:"
+        log "Composer:"
         "$PHP_BIN" "$COMPOSER_BIN" --version
+    fi
+
+    if [[ -n "$HEALTH_URL" ]]; then
+        require_command curl
+
+        log "HTTP health check: $HEALTH_URL"
+
+        local status
+
+        status="$(
+            curl \
+                --silent \
+                --show-error \
+                --output /dev/null \
+                --write-out '%{http_code}' \
+                --max-time "$HEALTH_TIMEOUT" \
+                "$HEALTH_URL"
+        )"
+
+        if [[ "$status" != "$HEALTH_EXPECTED_STATUS" ]]; then
+            error "Health check failed. HTTP $status"
+            return 1
+        fi
+
+        success "HTTP health check passed."
     fi
 
     success "Health check completed."
 }
 
 ###############################################################################
-# Laravel maintenance cleanup
-###############################################################################
-
-clear_everything() {
-    CURRENT_STEP="Clear all Laravel caches"
-
-    section "Clear Everything"
-
-    php_artisan optimize:clear
-    php_artisan cache:clear
-
-    success "Laravel caches cleared."
-}
-
-###############################################################################
-# Full deployment
+# FULL DEPLOYMENT
 ###############################################################################
 
 deploy_all() {
@@ -1036,67 +1066,47 @@ deploy_all() {
     log "Target: $TARGET"
     log "Branch: $BRANCH"
 
-    if [[ -n "$GIT_DIR" ]]; then
-        log "Git directory: $GIT_DIR"
-    fi
+    acquire_lock
 
-    echo
+    maintenance_down
 
-    ###########################################################################
-    # Git
-    ###########################################################################
-
-    if [[ -n "$GIT_DIR" ]]; then
-        git_checkout
-    fi
+    git_checkout
 
     cd "$TARGET"
 
-    ###########################################################################
-    # Packistry
-    ###########################################################################
-
     configure_packistry
-
-    ###########################################################################
-    # Composer
-    ###########################################################################
 
     composer_validate
     composer_install
-
-    ###########################################################################
-    # NPM
-    ###########################################################################
 
     if [[ -f "$TARGET/package.json" ]]; then
         npm_install
         npm_build
     else
-        warning "package.json not found. Skipping NPM."
+        warning "package.json not found. Skipping Node."
     fi
 
-    ###########################################################################
-    # Laravel
-    ###########################################################################
-
-    artisan_optimize_clear
+    optimize_clear
 
     migrate
 
     storage_link
 
-    artisan_optimize
+    optimize
 
     queue_restart
 
+    permissions
+
     health_check
+
+    maintenance_up
 
     success "FULL DEPLOYMENT COMPLETED."
 }
 
 ###############################################################################
-# Fast production deployment
+# PRODUCTION DEPLOYMENT
 ###############################################################################
 
 deploy_production() {
@@ -1104,15 +1114,18 @@ deploy_production() {
 
     section "PRODUCTION DEPLOYMENT"
 
-    if [[ -n "$GIT_DIR" ]]; then
-        git_checkout
-    fi
+    acquire_lock
+
+    maintenance_down
+
+    git_checkout
 
     cd "$TARGET"
 
     configure_packistry
 
-    composer_install_production
+    composer_validate
+    composer_install_prod
 
     if [[ -f "$TARGET/package-lock.json" ]]; then
         npm_ci
@@ -1124,549 +1137,294 @@ deploy_production() {
         npm_build
     fi
 
-    artisan_optimize_clear
+    optimize_clear
 
     migrate
 
     storage_link
 
-    artisan_optimize
+    optimize
 
     queue_restart
 
+    permissions
+
     health_check
+
+    maintenance_up
 
     success "PRODUCTION DEPLOYMENT COMPLETED."
 }
 
 ###############################################################################
-# Custom Artisan command
-###############################################################################
-
-run_artisan_command() {
-    local command="$1"
-    shift || true
-
-    CURRENT_STEP="Custom Artisan command"
-
-    section "Artisan: $command"
-
-    php_artisan "$command" "$@"
-}
-
-###############################################################################
-# Custom shell command
-###############################################################################
-
-run_command() {
-    CURRENT_STEP="Custom command"
-
-    section "Custom Command"
-
-    run_shell "$*"
-}
-
-###############################################################################
-# Environment information
+# INFO
 ###############################################################################
 
 show_info() {
-    section "Deployment Environment"
+    section "Deployment Information"
 
-    echo "Target:          $TARGET"
-    echo "Git directory:   ${GIT_DIR:-<not configured>}"
+    echo "Script:          $SCRIPT_NAME"
+    echo "Version:         $SCRIPT_VERSION"
+    echo "Target:          ${TARGET:-<unset>}"
+    echo "Git directory:   ${GIT_DIR:-<unset>}"
     echo "Branch:          $BRANCH"
     echo "PHP:             $PHP_BIN"
     echo "Composer:        $COMPOSER_BIN"
-    echo "Node:             $NODE_BIN"
-    echo "NPM:              $NPM_BIN"
-    echo "Git:              $GIT_BIN"
+    echo "Node:            $NODE_BIN"
+    echo "NPM:             $NPM_BIN"
+    echo "Git:             $GIT_BIN"
     echo "Packistry:       $PACKISTRY_URL"
     echo "Memory limit:    $MEMORY_LIMIT"
     echo "Dry run:         $DRY_RUN"
     echo "Verbose:         $VERBOSE"
-    echo "Run as user:     ${RUN_AS_USER:-<unchanged>}"
 }
 
 ###############################################################################
-# Help
+# HELP
 ###############################################################################
 
 show_help() {
-cat <<'EOF'
+cat <<EOF
 
-Universal Laravel Deployment Script
-====================================
+$SCRIPT_NAME v$SCRIPT_VERSION
 
-USAGE:
+Universal Laravel deployment runner for bare Git repositories.
 
-  deploy.sh [OPTIONS] [COMMANDS]
+USAGE
 
+    $SCRIPT_NAME [OPTIONS]
 
 CONFIGURATION
--------------
 
-  --target PATH
-      Laravel application directory.
-
-  --git-dir PATH
-      Git repository directory.
-
-  --branch NAME
-      Git branch to deploy.
-
-  --php PATH
-      PHP executable.
-
-  --composer PATH
-      Composer executable.
-
-  --npm PATH
-      NPM executable.
-
-  --node PATH
-      Node executable.
-
-  --git PATH
-      Git executable.
-
-  --packistry URL
-      Packistry Composer repository.
-
-  --memory-limit VALUE
-      PHP memory limit. Default: 512M.
-
-  --user USER
-      User for permission changes.
-
-  --group GROUP
-      Group for permission changes.
-
+    --target PATH
+    --git-dir PATH
+    --branch NAME
+    --php PATH
+    --composer-bin PATH
+    --npm-bin PATH
+    --node-bin PATH
+    --git-bin PATH
+    --packistry-url URL
+    --memory-limit VALUE
+    --user USER
+    --group GROUP
 
 GIT
----
 
-  --checkout
-      Checkout configured branch into target.
-
-  --pull
-      Git pull --ff-only.
-
-  --fetch
-      Git fetch --all --prune.
-
-  --reset
-      Git reset --hard.
-
-  --clean
-      Git clean -fd.
-
-  --git-status
-      Show Git status.
-
+    --checkout
+    --fetch
+    --status
+    --reset
+    --clean
 
 COMPOSER
---------
 
-  --packistry
-      Replace ../../Packages/* path repository
-      with the configured Packistry repository.
-
-  --composer
-      Composer install.
-
-  --composer-prod
-      Composer production install with --no-dev.
-
-  --composer-update
-      Composer update.
-
-  --composer-validate
-      Validate composer.json.
-
-  --composer-autoload
-      Dump optimized Composer autoload.
-
-  --composer-clear-cache
-      Clear Composer cache.
-
-  --composer-about
-      Show Composer information.
-
+    --packistry
+    --composer
+    --composer-prod
+    --composer-update
+    --composer-validate
+    --composer-autoload
+    --composer-clear-cache
 
 NODE / NPM
-----------
 
-  --node-version
-      Show Node and NPM versions.
+    --npm
+    --npm-ci
+    --npm-update
+    --npm-build
+    --npm-audit
 
-  --npm
-      npm install.
+LARAVEL
 
-  --npm-ci
-      npm ci.
+    --maintenance-down
+    --maintenance-up
 
-  --npm-update
-      npm update.
+    --optimize-clear
+    --optimize
 
-  --npm-audit
-      npm audit.
+    --config-clear
+    --config-cache
 
-  --npm-outdated
-      npm outdated.
+    --route-clear
+    --route-cache
 
-  --build
-      npm run build.
+    --view-clear
+    --view-cache
 
-  --dev
-      npm run dev.
+    --event-clear
+    --event-cache
 
-
-LARAVEL MAINTENANCE
--------------------
-
-  --maintenance-down
-      Enable Laravel maintenance mode.
-
-  --maintenance-up
-      Disable Laravel maintenance mode.
-
-
-LARAVEL CACHE
--------------
-
-  --optimize-clear
-      php artisan optimize:clear.
-
-  --optimize
-      php artisan optimize.
-
-  --config-clear
-      Clear config cache.
-
-  --config-cache
-      Cache configuration.
-
-  --route-clear
-      Clear route cache.
-
-  --route-cache
-      Cache routes.
-
-  --view-clear
-      Clear compiled views.
-
-  --view-cache
-      Cache views.
-
-  --event-clear
-      Clear event cache.
-
-  --event-cache
-      Cache events.
-
-  --cache-clear
-      Clear application cache.
-
-  --clear
-      Clear Laravel caches.
-
+    --cache-clear
 
 DATABASE
---------
 
-  --migrate
-      Run database migrations.
-
-  --migrate-status
-      Show migration status.
-
-  --migrate-rollback
-      Roll back latest migrations.
-
-  --migrate-fresh
-      DROP ALL TABLES and recreate database.
-
-  --seed
-      Run database seeders.
-
+    --migrate
+    --migrate-status
+    --migrate-rollback
+    --migrate-fresh
+    --seed
 
 STORAGE
--------
 
-  --storage-link
-      Create Laravel storage symlink.
-
-  --storage-unlink
-      Remove Laravel storage symlink.
-
+    --storage-link
+    --storage-unlink
 
 QUEUE
------
 
-  --queue-restart
-      Restart Laravel queue workers.
-
-  --queue-work
-      Start queue worker.
-
-  --queue-flush
-      Flush queue.
-
-  --failed-retry
-      Retry failed jobs.
-
-  --failed-flush
-      Flush failed jobs.
-
+    --queue-restart
+    --queue-work
+    --queue-flush
+    --failed-retry
+    --failed-flush
 
 SCHEDULER
----------
 
-  --schedule-list
-      Show Laravel scheduled tasks.
-
+    --schedule-list
 
 HORIZON
--------
 
-  --horizon-pause
-      Pause Horizon.
-
-  --horizon-continue
-      Continue Horizon.
-
-  --horizon-terminate
-      Terminate Horizon workers.
-
-
-PASSPORT
---------
-
-  --passport-install
-      Install Passport.
-
-  --passport-keys
-      Generate Passport keys.
-
+    --horizon-pause
+    --horizon-continue
+    --horizon-terminate
 
 OTHER
------
 
-  --vendor-publish
-      Publish all vendor resources.
-
-  --permissions
-      Fix storage/bootstrap permissions.
-
-  --health
-      Run deployment health check.
-
-  --info
-      Show deployment environment.
-
-  --artisan COMMAND [ARGS...]
-      Run an arbitrary Artisan command.
-
-  --command "COMMAND"
-      Run an arbitrary shell command.
-
+    --permissions
+    --health
+    --info
 
 DEPLOYMENT PRESETS
-------------------
 
-  --production
-      Production deployment:
+    --production
+    --all
 
-        checkout
-        packistry
-        composer --no-dev
-        npm install/ci
-        npm build
-        optimize:clear
-        migrate
-        storage:link
-        optimize
-        queue:restart
-        health check
+RUNTIME
 
-
-  --all
-      Full deployment with standard production workflow.
-
-
-EXECUTION OPTIONS
------------------
-
-  --dry-run
-      Show what would be executed without executing commands.
-
-  --verbose
-      Show detailed execution information.
-
-  --yes
-      Automatically answer yes to confirmation prompts.
-
-  --force
-      Force dangerous operations where applicable.
-
-  --help
-      Show this help.
-
+    --dry-run
+    --verbose
+    --yes
+    --force
+    --help
 
 EXAMPLES
---------
 
-Basic deployment:
+    $SCRIPT_NAME \\
+        --target /var/www/example.com \\
+        --git-dir /var/repositories/example.git \\
+        --branch main \\
+        --all
 
-  ./deploy.sh --target /var/www/site --all
+    $SCRIPT_NAME \\
+        --target /var/www/example.com \\
+        --composer \\
+        --npm-ci \\
+        --npm-build
 
+    $SCRIPT_NAME \\
+        --target /var/www/example.com \\
+        --packistry \\
+        --composer
 
-Git deployment:
+    $SCRIPT_NAME \\
+        --target /var/www/example.com \\
+        --migrate \\
+        --optimize-clear \\
+        --optimize
 
-  ./deploy.sh \
-      --target /var/www/site \
-      --git-dir /var/repositories/site \
-      --branch main \
-      --checkout
-
-
-Composer only:
-
-  ./deploy.sh \
-      --target /var/www/site \
-      --packistry \
-      --composer
-
-
-Build frontend:
-
-  ./deploy.sh \
-      --target /var/www/site \
-      --npm-ci \
-      --build
-
-
-Laravel:
-
-  ./deploy.sh \
-      --target /var/www/site \
-      --optimize-clear \
-      --migrate \
-      --storage-link \
-      --optimize
-
-
-Full production deployment:
-
-  ./deploy.sh \
-      --target /var/www/site \
-      --git-dir /var/repositories/site \
-      --branch main \
-      --production
-
-
-Dry run:
-
-  ./deploy.sh \
-      --target /var/www/site \
-      --all \
-      --dry-run
-
-
-Custom Artisan command:
-
-  ./deploy.sh \
-      --target /var/www/site \
-      --artisan "queue:restart"
-
-
-Custom shell command:
-
-  ./deploy.sh \
-      --target /var/www/site \
-      --command "php artisan about"
-
+    $SCRIPT_NAME \\
+        --target /var/www/example.com \\
+        --all \\
+        --dry-run
 
 EOF
 }
 
 ###############################################################################
-# Argument parsing
+# ARGUMENT PARSER
 ###############################################################################
-
-COMMANDS=()
 
 while [[ $# -gt 0 ]]; do
 
     case "$1" in
 
-        #######################################################################
-        # Configuration
-        #######################################################################
-
         --target)
-            TARGET="$2"
+            TARGET="${2:?Missing value for --target}"
             shift 2
             ;;
 
         --git-dir)
-            GIT_DIR="$2"
+            GIT_DIR="${2:?Missing value for --git-dir}"
             shift 2
             ;;
 
         --branch)
-            BRANCH="$2"
+            BRANCH="${2:?Missing value for --branch}"
             shift 2
             ;;
 
         --php)
-            PHP_BIN="$2"
+            PHP_BIN="${2:?Missing value for --php}"
             shift 2
             ;;
 
-        --composer)
-            COMMANDS+=("composer")
-            shift
-            ;;
-
         --composer-bin)
-            COMPOSER_BIN="$2"
+            COMPOSER_BIN="${2:?Missing value for --composer-bin}"
             shift 2
             ;;
 
         --npm-bin)
-            NPM_BIN="$2"
+            NPM_BIN="${2:?Missing value for --npm-bin}"
             shift 2
             ;;
 
-        --node)
-            NODE_BIN="$2"
+        --node-bin)
+            NODE_BIN="${2:?Missing value for --node-bin}"
             shift 2
             ;;
 
         --git-bin)
-            GIT_BIN="$2"
+            GIT_BIN="${2:?Missing value for --git-bin}"
             shift 2
             ;;
 
         --packistry-url)
-            PACKISTRY_URL="$2"
+            PACKISTRY_URL="${2:?Missing value for --packistry-url}"
             shift 2
             ;;
 
         --memory-limit)
-            MEMORY_LIMIT="$2"
+            MEMORY_LIMIT="${2:?Missing value for --memory-limit}"
             shift 2
             ;;
 
         --user)
-            RUN_AS_USER="$2"
+            RUN_AS_USER="${2:?Missing value for --user}"
             shift 2
             ;;
 
         --group)
-            RUN_AS_GROUP="$2"
+            RUN_AS_GROUP="${2:?Missing value for --group}"
+            shift 2
+            ;;
+
+        --health-url)
+            HEALTH_URL="${2:?Missing value for --health-url}"
+            shift 2
+            ;;
+
+        --health-status)
+            HEALTH_EXPECTED_STATUS="${2:?Missing value for --health-status}"
+            shift 2
+            ;;
+
+        --health-timeout)
+            HEALTH_TIMEOUT="${2:?Missing value for --health-timeout}"
+            shift 2
+            ;;
+
+        --log-dir)
+            LOG_DIR="${2:?Missing value for --log-dir}"
             shift 2
             ;;
 
@@ -1679,13 +1437,13 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
-        --pull)
-            COMMANDS+=("pull")
+        --fetch)
+            COMMANDS+=("fetch")
             shift
             ;;
 
-        --fetch)
-            COMMANDS+=("fetch")
+        --status)
+            COMMANDS+=("status")
             shift
             ;;
 
@@ -1699,17 +1457,17 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
-        --git-status)
-            COMMANDS+=("git-status")
-            shift
-            ;;
-
         #######################################################################
         # Composer
         #######################################################################
 
         --packistry)
             COMMANDS+=("packistry")
+            shift
+            ;;
+
+        --composer)
+            COMMANDS+=("composer")
             shift
             ;;
 
@@ -1738,19 +1496,9 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
-        --composer-about)
-            COMMANDS+=("composer-about")
-            shift
-            ;;
-
         #######################################################################
         # NPM
         #######################################################################
-
-        --node-version)
-            COMMANDS+=("node-version")
-            shift
-            ;;
 
         --npm)
             COMMANDS+=("npm")
@@ -1767,28 +1515,18 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
+        --npm-build|--build)
+            COMMANDS+=("npm-build")
+            shift
+            ;;
+
         --npm-audit)
             COMMANDS+=("npm-audit")
             shift
             ;;
 
-        --npm-outdated)
-            COMMANDS+=("npm-outdated")
-            shift
-            ;;
-
-        --build)
-            COMMANDS+=("build")
-            shift
-            ;;
-
-        --dev)
-            COMMANDS+=("dev")
-            shift
-            ;;
-
         #######################################################################
-        # Maintenance
+        # Laravel
         #######################################################################
 
         --maintenance-down)
@@ -1800,10 +1538,6 @@ while [[ $# -gt 0 ]]; do
             COMMANDS+=("maintenance-up")
             shift
             ;;
-
-        #######################################################################
-        # Cache
-        #######################################################################
 
         --optimize-clear)
             COMMANDS+=("optimize-clear")
@@ -1857,11 +1591,6 @@ while [[ $# -gt 0 ]]; do
 
         --cache-clear)
             COMMANDS+=("cache-clear")
-            shift
-            ;;
-
-        --clear)
-            COMMANDS+=("clear")
             shift
             ;;
 
@@ -1938,17 +1667,13 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         #######################################################################
-        # Scheduler
+        # Scheduler / Horizon
         #######################################################################
 
         --schedule-list)
             COMMANDS+=("schedule-list")
             shift
             ;;
-
-        #######################################################################
-        # Horizon
-        #######################################################################
 
         --horizon-pause)
             COMMANDS+=("horizon-pause")
@@ -1966,27 +1691,8 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         #######################################################################
-        # Passport
-        #######################################################################
-
-        --passport-install)
-            COMMANDS+=("passport-install")
-            shift
-            ;;
-
-        --passport-keys)
-            COMMANDS+=("passport-keys")
-            shift
-            ;;
-
-        #######################################################################
         # Misc
         #######################################################################
-
-        --vendor-publish)
-            COMMANDS+=("vendor-publish")
-            shift
-            ;;
 
         --permissions)
             COMMANDS+=("permissions")
@@ -2015,32 +1721,6 @@ while [[ $# -gt 0 ]]; do
         --all)
             COMMANDS+=("all")
             shift
-            ;;
-
-        #######################################################################
-        # Custom
-        #######################################################################
-
-        --artisan)
-            [[ $# -ge 2 ]] || {
-                error "--artisan requires a command."
-                exit 1
-            }
-
-            run_artisan_command "$2" "${@:3}"
-
-            exit $?
-            ;;
-
-        --command)
-            [[ $# -ge 2 ]] || {
-                error "--command requires a command."
-                exit 1
-            }
-
-            run_command "$2"
-
-            exit $?
             ;;
 
         #######################################################################
@@ -2073,10 +1753,15 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
 
+        --version|-v)
+            echo "$SCRIPT_NAME $SCRIPT_VERSION"
+            exit 0
+            ;;
+
         *)
             error "Unknown option: $1"
             echo
-            echo "Run with --help for available options."
+            show_help
             exit 1
             ;;
 
@@ -2085,7 +1770,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 ###############################################################################
-# Validate
+# MAIN
 ###############################################################################
 
 if [[ ${#COMMANDS[@]} -eq 0 ]]; then
@@ -2093,37 +1778,27 @@ if [[ ${#COMMANDS[@]} -eq 0 ]]; then
     exit 0
 fi
 
-if [[ ! -d "$TARGET" ]]; then
-    error "Target directory does not exist: $TARGET"
-    exit 1
-fi
-
-if [[ "$DRY_RUN" == false ]]; then
-    require_command "$PHP_BIN"
-fi
+validate_environment
+setup_logging
 
 ###############################################################################
-# Execute commands in requested order
+# COMMAND EXECUTION
 ###############################################################################
 
 for COMMAND in "${COMMANDS[@]}"; do
 
     case "$COMMAND" in
 
-        #######################################################################
-        # Git
-        #######################################################################
-
         checkout)
             git_checkout
             ;;
 
-        pull)
-            git_pull
-            ;;
-
         fetch)
             git_fetch
+            ;;
+
+        status)
+            git_status
             ;;
 
         reset)
@@ -2134,14 +1809,6 @@ for COMMAND in "${COMMANDS[@]}"; do
             git_clean
             ;;
 
-        git-status)
-            git_status
-            ;;
-
-        #######################################################################
-        # Composer
-        #######################################################################
-
         packistry)
             configure_packistry
             ;;
@@ -2151,7 +1818,7 @@ for COMMAND in "${COMMANDS[@]}"; do
             ;;
 
         composer-prod)
-            composer_install_production
+            composer_install_prod
             ;;
 
         composer-update)
@@ -2163,23 +1830,11 @@ for COMMAND in "${COMMANDS[@]}"; do
             ;;
 
         composer-autoload)
-            composer_dump_autoload
+            composer_autoload
             ;;
 
         composer-clear-cache)
             composer_clear_cache
-            ;;
-
-        composer-about)
-            composer_about
-            ;;
-
-        #######################################################################
-        # NPM
-        #######################################################################
-
-        node-version)
-            node_version
             ;;
 
         npm)
@@ -2194,25 +1849,13 @@ for COMMAND in "${COMMANDS[@]}"; do
             npm_update
             ;;
 
-        npm-audit)
-            npm_audit
-            ;;
-
-        npm-outdated)
-            npm_outdated
-            ;;
-
-        build)
+        npm-build)
             npm_build
             ;;
 
-        dev)
-            npm_dev
+        npm-audit)
+            npm_audit
             ;;
-
-        #######################################################################
-        # Maintenance
-        #######################################################################
 
         maintenance-down)
             maintenance_down
@@ -2222,16 +1865,12 @@ for COMMAND in "${COMMANDS[@]}"; do
             maintenance_up
             ;;
 
-        #######################################################################
-        # Cache
-        #######################################################################
-
         optimize-clear)
-            artisan_optimize_clear
+            optimize_clear
             ;;
 
         optimize)
-            artisan_optimize
+            optimize
             ;;
 
         config-clear)
@@ -2270,14 +1909,6 @@ for COMMAND in "${COMMANDS[@]}"; do
             cache_clear
             ;;
 
-        clear)
-            clear_everything
-            ;;
-
-        #######################################################################
-        # Database
-        #######################################################################
-
         migrate)
             migrate
             ;;
@@ -2295,12 +1926,8 @@ for COMMAND in "${COMMANDS[@]}"; do
             ;;
 
         seed)
-            db_seed
+            seed
             ;;
-
-        #######################################################################
-        # Storage
-        #######################################################################
 
         storage-link)
             storage_link
@@ -2309,10 +1936,6 @@ for COMMAND in "${COMMANDS[@]}"; do
         storage-unlink)
             storage_unlink
             ;;
-
-        #######################################################################
-        # Queue
-        #######################################################################
 
         queue-restart)
             queue_restart
@@ -2327,24 +1950,16 @@ for COMMAND in "${COMMANDS[@]}"; do
             ;;
 
         failed-retry)
-            failed_jobs_retry
+            failed_retry
             ;;
 
         failed-flush)
-            failed_jobs_flush
+            failed_flush
             ;;
-
-        #######################################################################
-        # Scheduler
-        #######################################################################
 
         schedule-list)
             schedule_list
             ;;
-
-        #######################################################################
-        # Horizon
-        #######################################################################
 
         horizon-pause)
             horizon_pause
@@ -2358,26 +1973,6 @@ for COMMAND in "${COMMANDS[@]}"; do
             horizon_terminate
             ;;
 
-        #######################################################################
-        # Passport
-        #######################################################################
-
-        passport-install)
-            passport_install
-            ;;
-
-        passport-keys)
-            passport_keys
-            ;;
-
-        #######################################################################
-        # Misc
-        #######################################################################
-
-        vendor-publish)
-            vendor_publish
-            ;;
-
         permissions)
             permissions
             ;;
@@ -2389,10 +1984,6 @@ for COMMAND in "${COMMANDS[@]}"; do
         info)
             show_info
             ;;
-
-        #######################################################################
-        # Presets
-        #######################################################################
 
         production)
             deploy_production
@@ -2412,11 +2003,14 @@ for COMMAND in "${COMMANDS[@]}"; do
 done
 
 ###############################################################################
-# Finished
+# FINISH
 ###############################################################################
 
+DURATION=$(( $(date +%s) - DEPLOYMENT_STARTED_AT ))
+
 echo
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}✓ Deployment commands completed successfully.${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}✓ Deployment completed successfully.${NC}"
+echo -e "${GREEN}  Duration: ${DURATION}s${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo
