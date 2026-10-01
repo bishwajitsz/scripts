@@ -14,6 +14,8 @@
 #       --branch main \
 #       --all
 #
+# v2.2.0: --color / --no-color (forced color for git hooks; ANSI stripped from logs)
+#
 # v2.1.0:
 #   - First-install (bootstrap) mode for --all / --production.
 #     On the first run it checks out the code, creates .env, installs
@@ -34,7 +36,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 SCRIPT_NAME="bare-repo-deploy"
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 
 ###############################################################################
 # DEFAULT CONFIGURATION
@@ -87,25 +89,47 @@ declare -a COMMANDS=()
 # COLORS
 ###############################################################################
 
-if [[ -t 1 ]]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[1;33m'
-    BLUE='\033[0;34m'
-    MAGENTA='\033[0;35m'
-    CYAN='\033[0;36m'
-    WHITE='\033[1;37m'
-    NC='\033[0m'
-else
-    RED=''
-    GREEN=''
-    YELLOW=''
-    BLUE=''
-    MAGENTA=''
-    CYAN=''
-    WHITE=''
-    NC=''
-fi
+COLOR_MODE="${DEPLOY_COLOR:-auto}"   # auto | always | never
+ANSI_FLAG=""
+
+RED=''
+GREEN=''
+YELLOW=''
+BLUE=''
+MAGENTA=''
+CYAN=''
+WHITE=''
+NC=''
+
+setup_colors() {
+    local enable=false
+
+    case "$COLOR_MODE" in
+        always) enable=true ;;
+        never)  enable=false ;;
+        *)
+            # auto: only when stdout is a terminal and NO_COLOR is not set
+            if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+                enable=true
+            fi
+            ;;
+    esac
+
+    if [[ "$enable" == true ]]; then
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[1;33m'
+        BLUE='\033[0;34m'
+        MAGENTA='\033[0;35m'
+        CYAN='\033[0;36m'
+        WHITE='\033[1;37m'
+        NC='\033[0m'
+
+        # Make child tools colorize too (they detect "not a TTY" otherwise)
+        ANSI_FLAG="--ansi"
+        export FORCE_COLOR=1
+    fi
+}
 
 ###############################################################################
 # LOGGING
@@ -306,8 +330,14 @@ php() {
         "$@"
 }
 
+composer_cmd() {
+    # shellcheck disable=SC2086
+    "$PHP_BIN" "$COMPOSER_BIN" "$@" $ANSI_FLAG
+}
+
 php_artisan() {
-    php "$TARGET/artisan" "$@"
+    # shellcheck disable=SC2086
+    php "$TARGET/artisan" "$@" $ANSI_FLAG
 }
 
 ###############################################################################
@@ -345,7 +375,7 @@ setup_logging() {
 
     LOG_FILE="$LOG_DIR/deploy-$(date '+%Y%m%d-%H%M%S').log"
 
-    exec > >(tee -a "$LOG_FILE") 2>&1
+    exec > >(tee >(sed -u -E 's/\x1b\[[0-9;]*[A-Za-z]//g' >> "$LOG_FILE")) 2>&1
 
     log "Log file: $LOG_FILE"
 }
@@ -539,7 +569,7 @@ composer_validate() {
 
     cd "$TARGET"
 
-    run "$PHP_BIN" "$COMPOSER_BIN" validate
+    run composer_cmd validate
 
     success "Composer validation completed."
 }
@@ -551,7 +581,7 @@ composer_install() {
 
     cd "$TARGET"
 
-    run "$PHP_BIN" "$COMPOSER_BIN" install \
+    run composer_cmd install \
         --no-interaction \
         --prefer-dist \
         --optimize-autoloader \
@@ -567,7 +597,7 @@ composer_install_prod() {
 
     cd "$TARGET"
 
-    run "$PHP_BIN" "$COMPOSER_BIN" install \
+    run composer_cmd install \
         --no-interaction \
         --prefer-dist \
         --optimize-autoloader \
@@ -589,7 +619,7 @@ composer_update() {
         return
     fi
 
-    run "$PHP_BIN" "$COMPOSER_BIN" update \
+    run composer_cmd update \
         --no-interaction \
         --prefer-dist \
         --ignore-platform-reqs
@@ -602,7 +632,7 @@ composer_autoload() {
 
     cd "$TARGET"
 
-    run "$PHP_BIN" "$COMPOSER_BIN" dump-autoload \
+    run composer_cmd dump-autoload \
         --optimize \
         --no-interaction
 }
@@ -612,7 +642,7 @@ composer_clear_cache() {
 
     section "Composer Cache"
 
-    run "$PHP_BIN" "$COMPOSER_BIN" clear-cache
+    run composer_cmd clear-cache
 }
 
 ###############################################################################
@@ -1059,7 +1089,7 @@ health_check() {
 
     if command_exists "$COMPOSER_BIN"; then
         log "Composer:"
-        "$PHP_BIN" "$COMPOSER_BIN" --version
+        composer_cmd --version
     fi
 
     if [[ -n "$HEALTH_URL" ]]; then
@@ -1450,6 +1480,8 @@ DEPLOYMENT PRESETS
 
 RUNTIME
 
+    --color        Force colored output (default: only on a terminal)
+    --no-color     Disable colored output (env: DEPLOY_COLOR=auto|always|never)
     --dry-run
     --verbose
     --yes
@@ -1600,6 +1632,16 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
+        --color)
+            COLOR_MODE="always"
+            shift
+            ;;
+
+        --no-color)
+            COLOR_MODE="never"
+            shift
+            ;;
+
         --dry-run)
             DRY_RUN=true
             shift
@@ -1650,6 +1692,8 @@ if [[ ${#COMMANDS[@]} -eq 0 ]]; then
     show_help
     exit 0
 fi
+
+setup_colors
 
 validate_environment
 setup_logging
