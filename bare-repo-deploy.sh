@@ -14,6 +14,17 @@
 #       --branch main \
 #       --all
 #
+# v2.1.0:
+#   - First-install (bootstrap) mode for --all / --production.
+#     On the first run it checks out the code, creates .env, installs
+#     dependencies, builds assets, generates APP_KEY, links storage, then
+#     STOPS (no migration, no maintenance mode) and tells the operator what
+#     to configure. The next push runs the normal full deployment.
+#   - Existing installs (artisan + vendor + .env present) are auto-detected
+#     and never re-bootstrapped.
+#   - maintenance_up now runs before the HTTP health check (it used to 503).
+#   - permissions() no longer fails when storage/ or bootstrap/cache is absent.
+#   - queue_flush uses queue:clear; failed_flush uses queue:flush.
 ###############################################################################
 
 set -Eeuo pipefail
@@ -23,7 +34,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 SCRIPT_NAME="bare-repo-deploy"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 
 ###############################################################################
 # DEFAULT CONFIGURATION
@@ -60,10 +71,11 @@ VERBOSE=false
 AUTO_YES=false
 FORCE=false
 
-MAINTENANCE=false
 MAINTENANCE_RETRY=60
 
 USE_NPM_CI="auto"
+
+BOOTSTRAP_MARKER=".deploy-bootstrapped"
 
 ###############################################################################
 # COMMAND QUEUE
@@ -136,6 +148,7 @@ CURRENT_STEP="initialization"
 DEPLOYMENT_STARTED_AT="$(date +%s)"
 
 MAINTENANCE_ENABLED=false
+FIRST_INSTALL_RAN=false
 
 cleanup() {
     local exit_code=$?
@@ -162,7 +175,7 @@ handle_error() {
     error "Step: ${CURRENT_STEP}"
     error "Exit code: ${exit_code}"
 
-    if [[ -f "${TARGET:-}/artisan" ]]; then
+    if [[ "$MAINTENANCE_ENABLED" == true && -f "${TARGET:-}/artisan" ]]; then
         warning "Attempting Laravel maintenance recovery..."
 
         if [[ "$DRY_RUN" == false ]]; then
@@ -378,9 +391,12 @@ git_status() {
 
     section "Git Status"
 
-    cd "$TARGET"
+    validate_git
 
-    run "$GIT_BIN" status
+    run "$GIT_BIN" \
+        --work-tree="$TARGET" \
+        --git-dir="$GIT_DIR" \
+        status
 }
 
 git_reset() {
@@ -388,14 +404,17 @@ git_reset() {
 
     section "Git Reset"
 
-    cd "$TARGET"
+    validate_git
 
     if ! confirm "Reset working tree?"; then
         warning "Cancelled."
         return
     fi
 
-    run "$GIT_BIN" reset --hard
+    run "$GIT_BIN" \
+        --work-tree="$TARGET" \
+        --git-dir="$GIT_DIR" \
+        reset --hard
 
     success "Git reset completed."
 }
@@ -405,14 +424,18 @@ git_clean() {
 
     section "Git Clean"
 
-    cd "$TARGET"
+    validate_git
 
     if ! confirm "Remove untracked files?"; then
         warning "Cancelled."
         return
     fi
 
-    run "$GIT_BIN" clean -fd
+    run "$GIT_BIN" \
+        --work-tree="$TARGET" \
+        --git-dir="$GIT_DIR" \
+        clean -fd \
+        -e .env -e auth.json -e "$BOOTSTRAP_MARKER" -e storage -e node_modules -e vendor
 
     success "Git clean completed."
 }
@@ -430,6 +453,11 @@ configure_packistry() {
 
     if [[ ! -f "$composer_file" ]]; then
         warning "composer.json not found."
+        return
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} Would rewrite ../../Packages/* repository to $PACKISTRY_URL"
         return
     fi
 
@@ -511,7 +539,7 @@ composer_validate() {
 
     cd "$TARGET"
 
-    run "$COMPOSER_BIN" validate
+    run "$PHP_BIN" "$COMPOSER_BIN" validate
 
     success "Composer validation completed."
 }
@@ -858,6 +886,12 @@ storage_link() {
 
     validate_laravel
 
+    # Idempotent: skip if the link already exists
+    if [[ -L "$TARGET/public/storage" ]]; then
+        log "public/storage link already exists."
+        return
+    fi
+
     php_artisan storage:link
 }
 
@@ -894,7 +928,7 @@ queue_work() {
 queue_flush() {
     CURRENT_STEP="Queue flush"
 
-    warning "This will flush queued jobs."
+    warning "This will clear queued jobs."
 
     if ! confirm "Continue?"; then
         return
@@ -902,7 +936,7 @@ queue_flush() {
 
     validate_laravel
 
-    php_artisan queue:flush
+    php_artisan queue:clear
 }
 
 failed_retry() {
@@ -968,7 +1002,7 @@ horizon_terminate() {
 }
 
 ###############################################################################
-# STORAGE / PERMISSIONS
+# PERMISSIONS
 ###############################################################################
 
 permissions() {
@@ -978,18 +1012,20 @@ permissions() {
 
     if [[ -z "$RUN_AS_USER" ]]; then
         warning "--user not supplied. Skipping ownership."
-        return
+        return 0
     fi
 
     local group="${RUN_AS_GROUP:-$RUN_AS_USER}"
 
     run chown -R "${RUN_AS_USER}:${group}" "$TARGET"
 
-    [[ -d "$TARGET/storage" ]] &&
+    if [[ -d "$TARGET/storage" ]]; then
         run chmod -R ug+rwX "$TARGET/storage"
+    fi
 
-    [[ -d "$TARGET/bootstrap/cache" ]] &&
+    if [[ -d "$TARGET/bootstrap/cache" ]]; then
         run chmod -R ug+rwX "$TARGET/bootstrap/cache"
+    fi
 
     success "Permissions updated."
 }
@@ -1040,7 +1076,7 @@ health_check() {
                 --output /dev/null \
                 --write-out '%{http_code}' \
                 --max-time "$HEALTH_TIMEOUT" \
-                "$HEALTH_URL"
+                "$HEALTH_URL" || true
         )"
 
         if [[ "$status" != "$HEALTH_EXPECTED_STATUS" ]]; then
@@ -1052,6 +1088,98 @@ health_check() {
     fi
 
     success "Health check completed."
+}
+
+###############################################################################
+# FIRST INSTALL (BOOTSTRAP)
+###############################################################################
+
+is_first_install() {
+    # Marker present -> already bootstrapped
+    if [[ -f "$TARGET/$BOOTSTRAP_MARKER" ]]; then
+        return 1
+    fi
+
+    # Pre-existing, working installation (deployed with an older script):
+    # adopt it instead of re-bootstrapping.
+    if [[ -f "$TARGET/artisan" \
+       && -f "$TARGET/vendor/autoload.php" \
+       && -f "$TARGET/.env" ]]; then
+        log "Existing installation detected. Skipping first-install mode."
+        run touch "$TARGET/$BOOTSTRAP_MARKER"
+        return 1
+    fi
+
+    return 0
+}
+
+first_install() {
+    CURRENT_STEP="First install"
+
+    section "FIRST INSTALL (bootstrap)"
+
+    log "No previous installation found. Bootstrapping..."
+
+    git_checkout
+
+    cd "$TARGET"
+
+    # .env (never overwritten)
+    if [[ ! -f .env ]]; then
+        if [[ -f .env.example ]]; then
+            run cp .env.example .env
+            warning ".env created from .env.example. You must edit it."
+        else
+            warning ".env.example not found. Create .env manually."
+        fi
+    fi
+
+    # Composer credentials check (Packistry)
+    if [[ ! -f "$TARGET/auth.json" \
+       && ! -f "${HOME:-/nonexistent}/.composer/auth.json" \
+       && ! -f "${HOME:-/nonexistent}/.config/composer/auth.json" \
+       && -z "${COMPOSER_AUTH:-}" ]]; then
+        warning "No Composer auth.json found. Packistry install may fail (401)."
+    fi
+
+    configure_packistry
+
+    composer_validate
+    composer_install
+
+    if [[ -f package.json ]]; then
+        npm_install
+        npm_build
+    else
+        warning "package.json not found. Skipping Node."
+    fi
+
+    # APP_KEY
+    if [[ -f .env ]] && ! grep -Eq '^APP_KEY=.+' .env; then
+        php_artisan key:generate --force
+    fi
+
+    php_artisan storage:link || warning "storage:link skipped."
+
+    permissions
+
+    run touch "$TARGET/$BOOTSTRAP_MARKER"
+
+    FIRST_INSTALL_RAN=true
+
+    section "FIRST INSTALL COMPLETED"
+
+    warning "Application is NOT fully deployed yet (no migration was run)."
+    echo
+    echo "  Configure the following on the server:"
+    echo "    1. Edit $TARGET/.env"
+    echo "         APP_ENV=production, APP_DEBUG=false, APP_URL=..."
+    echo "         DB_*, MAIL_*, QUEUE_*, CACHE_*, SESSION_*, etc."
+    echo "    2. Create the database (must match DB_* in .env)"
+    echo "    3. Make sure Packistry credentials exist (auth.json) if needed"
+    echo "    4. Trigger the real deployment with a new commit:"
+    echo "         git commit --allow-empty -m 'trigger deploy' && git push origin $BRANCH"
+    echo
 }
 
 ###############################################################################
@@ -1067,6 +1195,11 @@ deploy_all() {
     log "Branch: $BRANCH"
 
     acquire_lock
+
+    if is_first_install; then
+        first_install
+        return 0
+    fi
 
     maintenance_down
 
@@ -1098,9 +1231,10 @@ deploy_all() {
 
     permissions
 
-    health_check
-
+    # Bring the app online BEFORE the HTTP health check (otherwise 503)
     maintenance_up
+
+    health_check
 
     success "FULL DEPLOYMENT COMPLETED."
 }
@@ -1115,6 +1249,11 @@ deploy_production() {
     section "PRODUCTION DEPLOYMENT"
 
     acquire_lock
+
+    if is_first_install; then
+        first_install
+        return 0
+    fi
 
     maintenance_down
 
@@ -1149,9 +1288,9 @@ deploy_production() {
 
     permissions
 
-    health_check
-
     maintenance_up
+
+    health_check
 
     success "PRODUCTION DEPLOYMENT COMPLETED."
 }
@@ -1175,6 +1314,7 @@ show_info() {
     echo "Git:             $GIT_BIN"
     echo "Packistry:       $PACKISTRY_URL"
     echo "Memory limit:    $MEMORY_LIMIT"
+    echo "Bootstrap mark:  $BOOTSTRAP_MARKER"
     echo "Dry run:         $DRY_RUN"
     echo "Verbose:         $VERBOSE"
 }
@@ -1208,6 +1348,10 @@ CONFIGURATION
     --memory-limit VALUE
     --user USER
     --group GROUP
+    --health-url URL
+    --health-status CODE
+    --health-timeout SECONDS
+    --log-dir PATH
 
 GIT
 
@@ -1296,8 +1440,13 @@ OTHER
 
 DEPLOYMENT PRESETS
 
-    --production
-    --all
+    --production   Production deploy (composer --no-dev, npm ci)
+    --all          Full deploy
+
+    Both presets run in FIRST-INSTALL mode when $BOOTSTRAP_MARKER is
+    missing from the target: they bootstrap (checkout, .env, composer, npm,
+    APP_KEY, storage link) and stop before migrations. The next run does the
+    normal deployment.
 
 RUNTIME
 
@@ -1428,304 +1577,28 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
-        #######################################################################
-        # Git
-        #######################################################################
-
-        --checkout)
-            COMMANDS+=("checkout")
+        # Action flags: the command name is the flag without the leading "--"
+        --checkout|--fetch|--status|--reset|--clean|\
+        --packistry|--composer|--composer-prod|--composer-update|\
+        --composer-validate|--composer-autoload|--composer-clear-cache|\
+        --npm|--npm-ci|--npm-update|--npm-build|--npm-audit|\
+        --maintenance-down|--maintenance-up|\
+        --optimize-clear|--optimize|\
+        --config-clear|--config-cache|--route-clear|--route-cache|\
+        --view-clear|--view-cache|--event-clear|--event-cache|--cache-clear|\
+        --migrate|--migrate-status|--migrate-rollback|--migrate-fresh|--seed|\
+        --storage-link|--storage-unlink|\
+        --queue-restart|--queue-work|--queue-flush|--failed-retry|--failed-flush|\
+        --schedule-list|--horizon-pause|--horizon-continue|--horizon-terminate|\
+        --permissions|--health|--info|--production|--all)
+            COMMANDS+=("${1#--}")
             shift
             ;;
 
-        --fetch)
-            COMMANDS+=("fetch")
-            shift
-            ;;
-
-        --status)
-            COMMANDS+=("status")
-            shift
-            ;;
-
-        --reset)
-            COMMANDS+=("reset")
-            shift
-            ;;
-
-        --clean)
-            COMMANDS+=("clean")
-            shift
-            ;;
-
-        #######################################################################
-        # Composer
-        #######################################################################
-
-        --packistry)
-            COMMANDS+=("packistry")
-            shift
-            ;;
-
-        --composer)
-            COMMANDS+=("composer")
-            shift
-            ;;
-
-        --composer-prod)
-            COMMANDS+=("composer-prod")
-            shift
-            ;;
-
-        --composer-update)
-            COMMANDS+=("composer-update")
-            shift
-            ;;
-
-        --composer-validate)
-            COMMANDS+=("composer-validate")
-            shift
-            ;;
-
-        --composer-autoload)
-            COMMANDS+=("composer-autoload")
-            shift
-            ;;
-
-        --composer-clear-cache)
-            COMMANDS+=("composer-clear-cache")
-            shift
-            ;;
-
-        #######################################################################
-        # NPM
-        #######################################################################
-
-        --npm)
-            COMMANDS+=("npm")
-            shift
-            ;;
-
-        --npm-ci)
-            COMMANDS+=("npm-ci")
-            shift
-            ;;
-
-        --npm-update)
-            COMMANDS+=("npm-update")
-            shift
-            ;;
-
-        --npm-build|--build)
+        --build)
             COMMANDS+=("npm-build")
             shift
             ;;
-
-        --npm-audit)
-            COMMANDS+=("npm-audit")
-            shift
-            ;;
-
-        #######################################################################
-        # Laravel
-        #######################################################################
-
-        --maintenance-down)
-            COMMANDS+=("maintenance-down")
-            shift
-            ;;
-
-        --maintenance-up)
-            COMMANDS+=("maintenance-up")
-            shift
-            ;;
-
-        --optimize-clear)
-            COMMANDS+=("optimize-clear")
-            shift
-            ;;
-
-        --optimize)
-            COMMANDS+=("optimize")
-            shift
-            ;;
-
-        --config-clear)
-            COMMANDS+=("config-clear")
-            shift
-            ;;
-
-        --config-cache)
-            COMMANDS+=("config-cache")
-            shift
-            ;;
-
-        --route-clear)
-            COMMANDS+=("route-clear")
-            shift
-            ;;
-
-        --route-cache)
-            COMMANDS+=("route-cache")
-            shift
-            ;;
-
-        --view-clear)
-            COMMANDS+=("view-clear")
-            shift
-            ;;
-
-        --view-cache)
-            COMMANDS+=("view-cache")
-            shift
-            ;;
-
-        --event-clear)
-            COMMANDS+=("event-clear")
-            shift
-            ;;
-
-        --event-cache)
-            COMMANDS+=("event-cache")
-            shift
-            ;;
-
-        --cache-clear)
-            COMMANDS+=("cache-clear")
-            shift
-            ;;
-
-        #######################################################################
-        # Database
-        #######################################################################
-
-        --migrate)
-            COMMANDS+=("migrate")
-            shift
-            ;;
-
-        --migrate-status)
-            COMMANDS+=("migrate-status")
-            shift
-            ;;
-
-        --migrate-rollback)
-            COMMANDS+=("migrate-rollback")
-            shift
-            ;;
-
-        --migrate-fresh)
-            COMMANDS+=("migrate-fresh")
-            shift
-            ;;
-
-        --seed)
-            COMMANDS+=("seed")
-            shift
-            ;;
-
-        #######################################################################
-        # Storage
-        #######################################################################
-
-        --storage-link)
-            COMMANDS+=("storage-link")
-            shift
-            ;;
-
-        --storage-unlink)
-            COMMANDS+=("storage-unlink")
-            shift
-            ;;
-
-        #######################################################################
-        # Queue
-        #######################################################################
-
-        --queue-restart)
-            COMMANDS+=("queue-restart")
-            shift
-            ;;
-
-        --queue-work)
-            COMMANDS+=("queue-work")
-            shift
-            ;;
-
-        --queue-flush)
-            COMMANDS+=("queue-flush")
-            shift
-            ;;
-
-        --failed-retry)
-            COMMANDS+=("failed-retry")
-            shift
-            ;;
-
-        --failed-flush)
-            COMMANDS+=("failed-flush")
-            shift
-            ;;
-
-        #######################################################################
-        # Scheduler / Horizon
-        #######################################################################
-
-        --schedule-list)
-            COMMANDS+=("schedule-list")
-            shift
-            ;;
-
-        --horizon-pause)
-            COMMANDS+=("horizon-pause")
-            shift
-            ;;
-
-        --horizon-continue)
-            COMMANDS+=("horizon-continue")
-            shift
-            ;;
-
-        --horizon-terminate)
-            COMMANDS+=("horizon-terminate")
-            shift
-            ;;
-
-        #######################################################################
-        # Misc
-        #######################################################################
-
-        --permissions)
-            COMMANDS+=("permissions")
-            shift
-            ;;
-
-        --health)
-            COMMANDS+=("health")
-            shift
-            ;;
-
-        --info)
-            COMMANDS+=("info")
-            shift
-            ;;
-
-        #######################################################################
-        # Presets
-        #######################################################################
-
-        --production)
-            COMMANDS+=("production")
-            shift
-            ;;
-
-        --all)
-            COMMANDS+=("all")
-            shift
-            ;;
-
-        #######################################################################
-        # Runtime
-        #######################################################################
 
         --dry-run)
             DRY_RUN=true
@@ -1789,209 +1662,68 @@ for COMMAND in "${COMMANDS[@]}"; do
 
     case "$COMMAND" in
 
-        checkout)
-            git_checkout
-            ;;
+        checkout)             git_checkout ;;
+        fetch)                git_fetch ;;
+        status)               git_status ;;
+        reset)                git_reset ;;
+        clean)                git_clean ;;
 
-        fetch)
-            git_fetch
-            ;;
+        packistry)            configure_packistry ;;
+        composer)             composer_install ;;
+        composer-prod)        composer_install_prod ;;
+        composer-update)      composer_update ;;
+        composer-validate)    composer_validate ;;
+        composer-autoload)    composer_autoload ;;
+        composer-clear-cache) composer_clear_cache ;;
 
-        status)
-            git_status
-            ;;
+        npm)                  npm_install ;;
+        npm-ci)               npm_ci ;;
+        npm-update)           npm_update ;;
+        npm-build)            npm_build ;;
+        npm-audit)            npm_audit ;;
 
-        reset)
-            git_reset
-            ;;
+        maintenance-down)     maintenance_down ;;
+        maintenance-up)       maintenance_up ;;
 
-        clean)
-            git_clean
-            ;;
+        optimize-clear)       optimize_clear ;;
+        optimize)             optimize ;;
+        config-clear)         config_clear ;;
+        config-cache)         config_cache ;;
+        route-clear)          route_clear ;;
+        route-cache)          route_cache ;;
+        view-clear)           view_clear ;;
+        view-cache)           view_cache ;;
+        event-clear)          event_clear ;;
+        event-cache)          event_cache ;;
+        cache-clear)          cache_clear ;;
 
-        packistry)
-            configure_packistry
-            ;;
+        migrate)              migrate ;;
+        migrate-status)       migrate_status ;;
+        migrate-rollback)     migrate_rollback ;;
+        migrate-fresh)        migrate_fresh ;;
+        seed)                 seed ;;
 
-        composer)
-            composer_install
-            ;;
+        storage-link)         storage_link ;;
+        storage-unlink)       storage_unlink ;;
 
-        composer-prod)
-            composer_install_prod
-            ;;
+        queue-restart)        queue_restart ;;
+        queue-work)           queue_work ;;
+        queue-flush)          queue_flush ;;
+        failed-retry)         failed_retry ;;
+        failed-flush)         failed_flush ;;
 
-        composer-update)
-            composer_update
-            ;;
+        schedule-list)        schedule_list ;;
 
-        composer-validate)
-            composer_validate
-            ;;
+        horizon-pause)        horizon_pause ;;
+        horizon-continue)     horizon_continue ;;
+        horizon-terminate)    horizon_terminate ;;
 
-        composer-autoload)
-            composer_autoload
-            ;;
+        permissions)          permissions ;;
+        health)               health_check ;;
+        info)                 show_info ;;
 
-        composer-clear-cache)
-            composer_clear_cache
-            ;;
-
-        npm)
-            npm_install
-            ;;
-
-        npm-ci)
-            npm_ci
-            ;;
-
-        npm-update)
-            npm_update
-            ;;
-
-        npm-build)
-            npm_build
-            ;;
-
-        npm-audit)
-            npm_audit
-            ;;
-
-        maintenance-down)
-            maintenance_down
-            ;;
-
-        maintenance-up)
-            maintenance_up
-            ;;
-
-        optimize-clear)
-            optimize_clear
-            ;;
-
-        optimize)
-            optimize
-            ;;
-
-        config-clear)
-            config_clear
-            ;;
-
-        config-cache)
-            config_cache
-            ;;
-
-        route-clear)
-            route_clear
-            ;;
-
-        route-cache)
-            route_cache
-            ;;
-
-        view-clear)
-            view_clear
-            ;;
-
-        view-cache)
-            view_cache
-            ;;
-
-        event-clear)
-            event_clear
-            ;;
-
-        event-cache)
-            event_cache
-            ;;
-
-        cache-clear)
-            cache_clear
-            ;;
-
-        migrate)
-            migrate
-            ;;
-
-        migrate-status)
-            migrate_status
-            ;;
-
-        migrate-rollback)
-            migrate_rollback
-            ;;
-
-        migrate-fresh)
-            migrate_fresh
-            ;;
-
-        seed)
-            seed
-            ;;
-
-        storage-link)
-            storage_link
-            ;;
-
-        storage-unlink)
-            storage_unlink
-            ;;
-
-        queue-restart)
-            queue_restart
-            ;;
-
-        queue-work)
-            queue_work
-            ;;
-
-        queue-flush)
-            queue_flush
-            ;;
-
-        failed-retry)
-            failed_retry
-            ;;
-
-        failed-flush)
-            failed_flush
-            ;;
-
-        schedule-list)
-            schedule_list
-            ;;
-
-        horizon-pause)
-            horizon_pause
-            ;;
-
-        horizon-continue)
-            horizon_continue
-            ;;
-
-        horizon-terminate)
-            horizon_terminate
-            ;;
-
-        permissions)
-            permissions
-            ;;
-
-        health)
-            health_check
-            ;;
-
-        info)
-            show_info
-            ;;
-
-        production)
-            deploy_production
-            ;;
-
-        all)
-            deploy_all
-            ;;
+        production)           deploy_production ;;
+        all)                  deploy_all ;;
 
         *)
             error "Unknown internal command: $COMMAND"
@@ -2010,7 +1742,11 @@ DURATION=$(( $(date +%s) - DEPLOYMENT_STARTED_AT ))
 
 echo
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}✓ Deployment completed successfully.${NC}"
+if [[ "$FIRST_INSTALL_RAN" == true ]]; then
+    echo -e "${YELLOW}! First install finished. Configure .env + database, then push a new commit.${NC}"
+else
+    echo -e "${GREEN}✓ Deployment completed successfully.${NC}"
+fi
 echo -e "${GREEN}  Duration: ${DURATION}s${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo
