@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# ============================================================
+# Bare Git Repository - Post Receive Hook
+# Deployment script: bishwajitsz/scripts (see SCRIPT_VERSION)
+# ============================================================
+
+SCRIPT_VERSION="v2.2.0"
+DEPLOY_SCRIPT_URL="https://raw.githubusercontent.com/bishwajitsz/scripts/${SCRIPT_VERSION}/bare-repo-deploy.sh"
+
+USERNAME="copytrading"
+DOMAIN="copy-trading.softwarezon.cloud"
+
+TARGET="/home/${USERNAME}/htdocs/${DOMAIN}"
+GIT_DIR="/home/${USERNAME}/repo"
+BRANCH="main"
+DEPLOY_LOCK_FILE="${DEPLOY_LOCK_FILE:-/tmp/${USERNAME}-${DOMAIN}.deploy.lock}"
+
+PHP_BIN="/usr/bin/php8.5"
+COMPOSER_BIN="/usr/local/bin/composer"
+NPM_BIN="/usr/bin/npm"
+NODE_BIN="/usr/bin/node"
+GIT_BIN="/usr/bin/git"
+
+PACKISTRY_URL="https://packistry.tradifylabs.com"
+
+# Optional (set here, or export before the hook runs):
+# HEALTH_URL="https://copy-trading.softwarezon.cloud"
+# DEPLOY_LOG_DIR="/home/copytrading/deploy-logs"
+# DEPLOY_USER="copytrading"     # chown target to this user
+# DEPLOY_GROUP="copytrading"
+# DEPLOY_COLOR="never"         # always (default) | never
+
+HEALTH_URL="${HEALTH_URL:-}"
+DEPLOY_LOG_DIR="${DEPLOY_LOG_DIR:-}"
+DEPLOY_USER="${DEPLOY_USER:-}"
+DEPLOY_GROUP="${DEPLOY_GROUP:-}"
+DEPLOY_COLOR="${DEPLOY_COLOR:-always}"
+
+# Hook output goes to the pusher's terminal over SSH, so it is never a TTY
+# here. Colors are therefore forced unless DEPLOY_COLOR=never.
+if [[ "$DEPLOY_COLOR" == "never" || -n "${NO_COLOR:-}" ]]; then
+    C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''; C_BOLD=''; C_NC=''
+else
+    C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[1;33m'
+    C_BLUE=$'\033[0;34m'; C_CYAN=$'\033[0;36m'; C_BOLD=$'\033[1;37m'; C_NC=$'\033[0m'
+fi
+
+# Must match BOOTSTRAP_MARKER in bare-repo-deploy.sh
+BOOTSTRAP_MARKER=".deploy-bootstrapped"
+
+TMP_SCRIPT=""
+
+cleanup() {
+    if [[ -n "${TMP_SCRIPT:-}" && -f "$TMP_SCRIPT" ]]; then
+        rm -f "$TMP_SCRIPT"
+    fi
+}
+
+trap cleanup EXIT
+trap 'echo "${C_RED}[post-receive] Deployment failed on line $LINENO.${C_NC}" >&2' ERR
+
+
+# ============================================================
+# Read all received refs
+# ============================================================
+
+DEPLOY_OLD_REV=""
+DEPLOY_NEW_REV=""
+DEPLOY_REF=""
+
+while read -r oldrev newrev ref; do
+
+    if [[ "$ref" != "refs/heads/$BRANCH" ]]; then
+        echo "${C_YELLOW}[post-receive]${C_NC} Ignoring ref: $ref"
+        continue
+    fi
+
+    # Branch deletion
+    if [[ "$newrev" == "0000000000000000000000000000000000000000" ]]; then
+        echo "${C_YELLOW}[post-receive]${C_NC} Branch '$BRANCH' was deleted. Deployment skipped."
+        exit 0
+    fi
+
+    DEPLOY_OLD_REV="$oldrev"
+    DEPLOY_NEW_REV="$newrev"
+    DEPLOY_REF="$ref"
+
+done
+
+
+# ============================================================
+# Nothing to deploy
+# ============================================================
+
+if [[ -z "$DEPLOY_NEW_REV" ]]; then
+    exit 0
+fi
+
+
+# ============================================================
+# Validate required commands
+# ============================================================
+
+command -v /usr/bin/curl >/dev/null 2>&1 || {
+    echo "${C_RED}[post-receive] ERROR: curl is required.${C_NC}" >&2
+    exit 1
+}
+
+[[ -d "$GIT_DIR" ]] || {
+    echo "${C_RED}[post-receive] ERROR: Git directory does not exist: $GIT_DIR${C_NC}" >&2
+    exit 1
+}
+
+[[ -d "$TARGET" ]] || {
+    echo "${C_RED}[post-receive] ERROR: Deployment target does not exist: $TARGET${C_NC}" >&2
+    exit 1
+}
+
+
+# ============================================================
+# Deployment information
+# ============================================================
+
+# Was the app bootstrapped before this push?
+if [[ -f "$TARGET/$BOOTSTRAP_MARKER" ]]; then
+    WAS_BOOTSTRAPPED=true
+else
+    WAS_BOOTSTRAPPED=false
+fi
+
+echo
+echo "${C_CYAN}================================================================${C_NC}"
+echo "${C_BOLD} Bare Repository Deployment${C_NC}"
+echo "${C_CYAN}================================================================${C_NC}"
+echo " Script : $SCRIPT_VERSION"
+echo " Branch : $BRANCH"
+echo " Before : $DEPLOY_OLD_REV"
+echo " After  : $DEPLOY_NEW_REV"
+echo " Target : $TARGET"
+echo "${C_CYAN}================================================================${C_NC}"
+echo
+
+
+# ============================================================
+# Download pinned deployment script
+# ============================================================
+
+TMP_SCRIPT="$(mktemp /tmp/bare-repo-deploy.XXXXXX)"
+
+echo "${C_BLUE}[post-receive]${C_NC} Downloading deployment script $SCRIPT_VERSION..."
+
+/usr/bin/curl \
+    --fail \
+    --silent \
+    --show-error \
+    --location \
+    --retry 3 \
+    --connect-timeout 10 \
+    --max-time 60 \
+    "$DEPLOY_SCRIPT_URL" \
+    --output "$TMP_SCRIPT"
+
+[[ -s "$TMP_SCRIPT" ]] || {
+    echo "${C_RED}[post-receive] ERROR: Downloaded deployment script is empty.${C_NC}" >&2
+    exit 1
+}
+
+chmod 700 "$TMP_SCRIPT"
+
+
+# ============================================================
+# Execute deployment
+# ============================================================
+
+echo "${C_BLUE}[post-receive]${C_NC} Starting deployment..."
+echo
+
+export DEPLOY_OLD_REV
+export DEPLOY_NEW_REV
+export DEPLOY_REF
+export DEPLOY_LOCK_FILE
+
+ARGS=(
+    --target "$TARGET"
+    --git-dir "$GIT_DIR"
+    --branch "$BRANCH"
+
+    --php "$PHP_BIN"
+    --composer-bin "$COMPOSER_BIN"
+    --npm-bin "$NPM_BIN"
+    --node-bin "$NODE_BIN"
+    --git-bin "$GIT_BIN"
+
+    --packistry-url "$PACKISTRY_URL"
+
+    --all
+)
+
+if [[ "$DEPLOY_COLOR" == "never" || -n "${NO_COLOR:-}" ]]; then
+    ARGS+=(--no-color)
+else
+    ARGS+=(--color)
+fi
+
+if [[ -n "$HEALTH_URL" ]]; then
+    ARGS+=(--health-url "$HEALTH_URL")
+fi
+
+if [[ -n "$DEPLOY_LOG_DIR" ]]; then
+    ARGS+=(--log-dir "$DEPLOY_LOG_DIR")
+fi
+
+if [[ -n "$DEPLOY_USER" ]]; then
+    ARGS+=(--user "$DEPLOY_USER")
+fi
+
+if [[ -n "$DEPLOY_GROUP" ]]; then
+    ARGS+=(--group "$DEPLOY_GROUP")
+fi
+
+
+# The hook's stdin (the pushed refs) is already consumed; make sure the
+# deploy script never waits on it.
+"$TMP_SCRIPT" "${ARGS[@]}" </dev/null
+
+
+# ============================================================
+# Result
+# ============================================================
+
+echo
+echo "${C_CYAN}================================================================${C_NC}"
+
+if [[ "$WAS_BOOTSTRAPPED" == false ]]; then
+    echo "${C_YELLOW} First install completed - app is NOT fully deployed yet${C_NC}"
+    echo "${C_CYAN}================================================================${C_NC}"
+    echo " Next steps:"
+    echo "   1. Edit $TARGET/.env (APP_URL, DB_*, MAIL_*, ...)"
+    echo "   2. Create the database"
+    echo "   3. Push a new commit to '$BRANCH' to run the full deployment:"
+    echo "        git commit --allow-empty -m 'trigger deploy' && git push origin $BRANCH"
+else
+    echo "${C_GREEN} Deployment completed successfully${C_NC}"
+    echo "${C_CYAN}================================================================${C_NC}"
+    echo " Branch : $BRANCH"
+    echo " Commit : $DEPLOY_NEW_REV"
+fi
+
+echo "${C_CYAN}================================================================${C_NC}"
+echo

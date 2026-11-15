@@ -59,7 +59,9 @@ MEMORY_LIMIT="${MEMORY_LIMIT:-512M}"
 RUN_AS_USER="${DEPLOY_USER:-}"
 RUN_AS_GROUP="${DEPLOY_GROUP:-}"
 
-LOCK_FILE="${DEPLOY_LOCK_FILE:-/tmp/${SCRIPT_NAME}.lock}"
+# The default is resolved after TARGET is parsed so each deployed project has
+# its own lock. DEPLOY_LOCK_FILE remains available for an explicit shared path.
+LOCK_FILE="${DEPLOY_LOCK_FILE:-}"
 
 LOG_DIR="${DEPLOY_LOG_DIR:-}"
 LOG_FILE=""
@@ -351,7 +353,15 @@ acquire_lock() {
 
     require_command flock
 
-    exec {LOCK_FD}>"$LOCK_FILE"
+    if [[ -z "$LOCK_FILE" ]]; then
+        LOCK_FILE="$TARGET/.deploy.lock"
+    fi
+
+    if ! exec {LOCK_FD}>"$LOCK_FILE"; then
+        error "Cannot open deployment lock: $LOCK_FILE"
+        error "Ensure the deployment user can write the lock path or set DEPLOY_LOCK_FILE."
+        exit 1
+    fi
 
     if ! flock -n "$LOCK_FD"; then
         error "Another deployment is already running."
