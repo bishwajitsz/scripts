@@ -7,7 +7,7 @@ set -Eeuo pipefail
 # Deployment script: bishwajitsz/scripts (see SCRIPT_VERSION)
 # ============================================================
 
-SCRIPT_VERSION="v2.2.0"
+SCRIPT_VERSION="v2.3.0"
 DEPLOY_SCRIPT_URL="https://raw.githubusercontent.com/bishwajitsz/scripts/${SCRIPT_VERSION}/bare-repo-deploy.sh"
 
 USERNAME="copytrading"

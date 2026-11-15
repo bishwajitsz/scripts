@@ -14,6 +14,7 @@
 #       --branch main \
 #       --all
 #
+# v2.3.0: project-scoped deployment locks and explicit lock-open errors.
 # v2.2.0: --color / --no-color (forced color for git hooks; ANSI stripped from logs)
 #
 # v2.1.0:
@@ -36,7 +37,7 @@ set -Eeuo pipefail
 ###############################################################################
 
 SCRIPT_NAME="bare-repo-deploy"
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.0"
 
 ###############################################################################
 # DEFAULT CONFIGURATION
